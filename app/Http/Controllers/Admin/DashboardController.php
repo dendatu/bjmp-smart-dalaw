@@ -1,0 +1,378 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Http\Controllers\Controller;
+use App\Mail\BookingStatusChanged;
+use App\Models\Booking;
+use App\Models\Dormitory;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Validation\Rule;
+use Illuminate\Validation\ValidationException;
+use Illuminate\View\View;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+
+class DashboardController extends Controller
+{
+    public function index(Request $request)
+    {
+        $visibleBookings = Booking::visibleToUser($request->user());
+
+        $countsByStatus = (clone $visibleBookings)
+            ->selectRaw('status, COUNT(*) as total')
+            ->groupBy('status')
+            ->pluck('total', 'status');
+
+        $analytics = [
+            'total' => $countsByStatus->sum(),
+            'pending' => (int) $countsByStatus->get('Pending', 0),
+            'approved' => (int) $countsByStatus->get('Approved', 0),
+            'rejected' => (int) $countsByStatus->get('Rejected', 0),
+            'today' => (clone $visibleBookings)->whereDate('visit_date', today())->count(),
+            'upcoming' => (clone $visibleBookings)->whereDate('visit_date', '>=', today())
+                ->where('status', 'Approved')
+                ->count(),
+        ];
+
+        $query = Booking::visibleToUser($request->user())->with(['facility', 'dormitory']);
+
+        if ($request->has('status') && $request->status !== '') {
+            $query->where('status', $request->status);
+        }
+
+        if ($request->has('date') && $request->date !== '') {
+            $query->whereDate('visit_date', $request->date);
+        }
+
+        $bookings = $query->orderBy('created_at', 'desc')->paginate(20);
+
+        return view('admin.dashboard', compact('analytics', 'bookings'));
+    }
+
+    public function approve(Request $request, Booking $booking): RedirectResponse
+    {
+        $validated = $request->validate([
+            'reason' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        return $this->changeStatus($booking, 'Approved', $validated['reason'] ?? null);
+    }
+
+    public function reject(Request $request, Booking $booking): RedirectResponse
+    {
+        $validated = $request->validate([
+            'admin_remarks' => ['required', 'string', 'max:500'],
+        ]);
+
+        return $this->changeStatus($booking, 'Rejected', $validated['admin_remarks']);
+    }
+
+    public function updateStatus(Request $request, Booking $booking): RedirectResponse
+    {
+        $validated = $request->validate([
+            'status' => ['required', Rule::in(['Pending', 'Approved', 'Rejected'])],
+            'reason' => ['nullable', 'string', 'max:500'],
+        ]);
+
+        if (in_array($validated['status'], ['Pending', 'Rejected'], true) && blank($validated['reason'] ?? null)) {
+            throw ValidationException::withMessages([
+                'reason' => 'A reason is required when changing the status to Pending or Rejected.',
+            ]);
+        }
+
+        return $this->changeStatus($booking, $validated['status'], $validated['reason'] ?? null);
+    }
+
+    private function changeStatus(Booking $booking, string $status, ?string $reason): RedirectResponse
+    {
+        $previousStatus = $booking->status;
+
+        DB::transaction(function () use ($booking, $status, $reason, &$previousStatus): void {
+            $lockedBooking = Booking::visibleToUser(auth()->user())
+                ->lockForUpdate()
+                ->findOrFail($booking->id);
+
+            if ($lockedBooking->status === $status) {
+                throw ValidationException::withMessages([
+                    'status' => "This booking is already {$status}.",
+                ]);
+            }
+
+            if ($lockedBooking->status === 'Rejected' && $status !== 'Rejected') {
+                if (! $lockedBooking->dormitory_id) {
+                    throw ValidationException::withMessages([
+                        'status' => 'This visit cannot be reactivated because it has no dormitory assignment.',
+                    ]);
+                }
+
+                $dormitory = Dormitory::query()
+                    ->lockForUpdate()
+                    ->findOrFail($lockedBooking->dormitory_id);
+                $usage = $dormitory->slotUsage(
+                    $lockedBooking->visit_date->toDateString(),
+                    $lockedBooking->time_slot,
+                    $lockedBooking->id,
+                );
+                $channel = $lockedBooking->booking_channel ?? Booking::CHANNEL_ONLINE;
+
+                if (! $dormitory->acceptsChannel($channel, $usage)) {
+                    throw ValidationException::withMessages([
+                        'status' => $dormitory->capacityErrorMessage($channel, $usage),
+                    ]);
+                }
+            }
+
+            $previousStatus = $lockedBooking->status;
+            $lockedBooking->status = $status;
+            $lockedBooking->admin_remarks = $status === 'Rejected' ? $reason : null;
+            $lockedBooking->save();
+
+            $lockedBooking->statusHistory()->create([
+                'user_id' => auth()->id(),
+                'from_status' => $previousStatus,
+                'to_status' => $status,
+                'reason' => filled($reason) ? $reason : "Status changed to {$status}.",
+            ]);
+        });
+
+        // Send decision notifications after the transaction commits. Pending
+        // means the request still needs review, so it does not trigger a
+        // decision email. Mail failures must not roll back the status change.
+        if ($booking->visitor_email && in_array($status, ['Approved', 'Rejected'], true)) {
+            $booking->refresh();
+            try {
+                Mail::to($booking->visitor_email)->send(new BookingStatusChanged(
+                    $booking,
+                    $previousStatus,
+                    $status === 'Rejected' ? $reason : null,
+                ));
+            } catch (\Throwable $e) {
+                Log::error('Booking status-change email failed', [
+                    'reference_code' => $booking->reference_code,
+                    'mailer' => config('mail.default'),
+                    'error' => $e->getMessage(),
+                ]);
+            }
+        }
+
+        return redirect()->route('admin.dashboard')->with('success', "Booking status changed to {$status}.");
+    }
+
+    public function dailySummary(Request $request): View
+    {
+        [$summary, $bookings] = $this->buildVisitationSummary($request);
+
+        return view('admin.daily-summary', compact('summary', 'bookings'));
+    }
+
+    public function exportDailySummary(Request $request): StreamedResponse
+    {
+        [$summary, $bookings] = $this->buildVisitationSummary($request);
+
+        $filename = "visitation-summary_{$summary['from']}_to_{$summary['to']}.csv";
+
+        return response()->streamDownload(function () use ($summary, $bookings): void {
+            $output = fopen('php://output', 'w');
+            fwrite($output, "\xEF\xBB\xBF");
+
+            foreach ($this->visitationSummaryCsvRows($summary, $bookings) as $row) {
+                fputcsv($output, array_map($this->escapeCsvValue(...), $row));
+            }
+
+            fclose($output);
+        }, $filename, ['Content-Type' => 'text/csv; charset=UTF-8']);
+    }
+
+    /**
+     * @return array{0: array<string, mixed>, 1: Collection<int, Booking>}
+     */
+    private function buildVisitationSummary(Request $request): array
+    {
+        $validated = $request->validate([
+            'date' => ['nullable', 'date'],
+            'from' => ['nullable', 'date'],
+            'to' => ['nullable', 'date', 'after_or_equal:from'],
+        ]);
+
+        $singleDate = $validated['date'] ?? today()->toDateString();
+        $from = Carbon::parse($validated['from'] ?? $singleDate)->toDateString();
+        $to = Carbon::parse($validated['to'] ?? $validated['from'] ?? $singleDate)->toDateString();
+
+        $bookings = Booking::visibleToUser($request->user())
+            ->whereDate('visit_date', '>=', $from)
+            ->whereDate('visit_date', '<=', $to)
+            ->where('status', 'Approved')
+            ->with(['accompanyingVisitors', 'facility'])
+            ->orderBy('visit_date')
+            ->orderBy('time_slot')
+            ->get();
+
+        $summary = [
+            'from' => $from,
+            'to' => $to,
+            'total_visitors' => 0,
+            'by_sex' => ['Male' => 0, 'Female' => 0],
+            'by_age' => ['child' => 0, 'adult' => 0, 'senior' => 0],
+            'by_sex_and_age' => [
+                'Male' => ['child' => 0, 'adult' => 0, 'senior' => 0],
+                'Female' => ['child' => 0, 'adult' => 0, 'senior' => 0],
+            ],
+            'pwd' => 0,
+            'pregnant' => 0,
+            'priority' => 0,
+            'by_date' => [],
+        ];
+
+        foreach ($bookings as $booking) {
+            $visitDate = $booking->visit_date->toDateString();
+            $summary['by_date'][$visitDate] ??= [
+                'bookings' => 0, 'visitors' => 0, 'Male' => 0, 'Female' => 0, 'pwd' => 0, 'pregnant' => 0,
+            ];
+            $summary['by_date'][$visitDate]['bookings']++;
+
+            $visitors = collect([
+                [
+                    'age' => $booking->visitor_age,
+                    'sex' => $booking->visitor_sex,
+                    'is_pwd' => $booking->visitor_is_pwd,
+                    'is_pregnant' => $booking->visitor_is_pregnant,
+                ],
+            ]);
+
+            foreach ($booking->accompanyingVisitors as $accompanying) {
+                $visitors->push([
+                    'age' => $accompanying->age,
+                    'sex' => $accompanying->sex,
+                    'is_pwd' => $accompanying->is_pwd,
+                    'is_pregnant' => $accompanying->is_pregnant,
+                ]);
+            }
+
+            foreach ($visitors as $visitor) {
+                $summary['total_visitors']++;
+                $summary['by_sex'][$visitor['sex']]++;
+
+                if ($visitor['age'] < 18) {
+                    $ageCategory = 'child';
+                } elseif ($visitor['age'] >= 60) {
+                    $ageCategory = 'senior';
+                } else {
+                    $ageCategory = 'adult';
+                }
+
+                $summary['by_age'][$ageCategory]++;
+                $summary['by_sex_and_age'][$visitor['sex']][$ageCategory]++;
+
+                $summary['pwd'] += (int) $visitor['is_pwd'];
+                $summary['pregnant'] += (int) $visitor['is_pregnant'];
+                $summary['priority'] += (int) ($visitor['is_pwd'] || $visitor['is_pregnant']);
+
+                $summary['by_date'][$visitDate]['visitors']++;
+                $summary['by_date'][$visitDate][$visitor['sex']]++;
+                $summary['by_date'][$visitDate]['pwd'] += (int) $visitor['is_pwd'];
+                $summary['by_date'][$visitDate]['pregnant'] += (int) $visitor['is_pregnant'];
+            }
+        }
+
+        return [$summary, $bookings];
+    }
+
+    /**
+     * @param  array<string, mixed>  $summary
+     * @param  Collection<int, Booking>  $bookings
+     * @return list<list<string|int>>
+     */
+    private function visitationSummaryCsvRows(array $summary, Collection $bookings): array
+    {
+        $yesNo = fn (bool $value): string => $value ? 'Yes' : 'No';
+
+        $rows = [
+            ['Visitation Summary Report'],
+            ['From', $summary['from']],
+            ['To', $summary['to']],
+            ['Generated', now()->format('Y-m-d H:i')],
+            [],
+            ['Summary'],
+            ['Approved bookings', $bookings->count()],
+            ['Total visitors', $summary['total_visitors']],
+            ['Male', $summary['by_sex']['Male']],
+            ['Female', $summary['by_sex']['Female']],
+            ['Children (below 18)', $summary['by_age']['child']],
+            ['Adults (18-59)', $summary['by_age']['adult']],
+            ['Seniors (60+)', $summary['by_age']['senior']],
+            ['Persons with Disability (PWD)', $summary['pwd']],
+            ['Pregnant', $summary['pregnant']],
+            ['Total priority visitors', $summary['priority']],
+            [],
+            ['Breakdown by Date'],
+            ['Date', 'Bookings', 'Male', 'Female', 'PWD', 'Pregnant', 'Visitors'],
+        ];
+
+        foreach ($summary['by_date'] as $date => $day) {
+            $rows[] = [$date, $day['bookings'], $day['Male'], $day['Female'], $day['pwd'], $day['pregnant'], $day['visitors']];
+        }
+
+        $rows[] = [
+            'Total',
+            $bookings->count(),
+            $summary['by_sex']['Male'],
+            $summary['by_sex']['Female'],
+            $summary['pwd'],
+            $summary['pregnant'],
+            $summary['total_visitors'],
+        ];
+        $rows[] = [];
+        $rows[] = ['Visitors'];
+        $rows[] = ['Date', 'Time Slot', 'Reference', 'Visitor', 'Type', 'Sex', 'Age', 'PWD', 'Pregnant', 'PDL', 'Relationship to PDL', 'Facility'];
+
+        foreach ($bookings as $booking) {
+            $bookingColumns = [$booking->visit_date->toDateString(), $booking->time_slot, $booking->reference_code];
+            $facilityName = $booking->facility?->name ?? '';
+
+            $rows[] = [
+                ...$bookingColumns,
+                $booking->visitor_full_name,
+                'Primary',
+                $booking->visitor_sex,
+                $booking->visitor_age,
+                $yesNo($booking->visitor_is_pwd),
+                $yesNo($booking->visitor_is_pregnant),
+                $booking->pdl_full_name,
+                $booking->relationship_to_pdl,
+                $facilityName,
+            ];
+
+            foreach ($booking->accompanyingVisitors as $accompanying) {
+                $rows[] = [
+                    ...$bookingColumns,
+                    $accompanying->full_name,
+                    'Accompanying',
+                    $accompanying->sex,
+                    $accompanying->age,
+                    $yesNo($accompanying->is_pwd),
+                    $yesNo($accompanying->is_pregnant),
+                    $booking->pdl_full_name,
+                    $accompanying->relationship_to_pdl,
+                    $facilityName,
+                ];
+            }
+        }
+
+        return $rows;
+    }
+
+    private function escapeCsvValue(string|int|null $value): string|int
+    {
+        if (is_string($value) && preg_match('/^[=+\-@\t\r]/', $value) === 1) {
+            return "'".$value;
+        }
+
+        return $value ?? '';
+    }
+}
